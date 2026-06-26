@@ -1,17 +1,3 @@
-"""
-src/github/gh_client.py
-─────────────────────────────────────────────────────────────
-GitHub API Client
-Phase 1 responsibility:
-  - Authenticate with GitHub using GITHUB_TOKEN
-  - Fetch the full unified diff for the PR
-  - Fetch the list of changed files with metadata
-  - Post a markdown summary comment to the PR thread
-
-Later phases will extend this to post inline review comments.
-─────────────────────────────────────────────────────────────
-"""
-
 import os
 import logging
 from github import Github, GithubException
@@ -20,57 +6,24 @@ logger = logging.getLogger(__name__)
 
 
 class GitHubClient:
-    """
-    Wraps PyGithub to expose only the operations the agent needs.
-    All credentials come from environment variables — never hardcoded.
-    """
-
     def __init__(self):
         token = os.environ.get("GITHUB_TOKEN")
         if not token:
-            raise EnvironmentError(
-                "GITHUB_TOKEN is not set. "
-                "In GitHub Actions it is auto-injected. "
-                "For local dev, set it in your .env file."
-            )
-
+            raise EnvironmentError("GITHUB_TOKEN is not set.")
         self.client = Github(token)
         repo_name = os.environ.get("REPO_FULL_NAME")
         if not repo_name:
-            raise EnvironmentError("REPO_FULL_NAME environment variable is not set.")
-
+            raise EnvironmentError("REPO_FULL_NAME is not set.")
         self.repo = self.client.get_repo(repo_name)
         self.pr_number = int(os.environ.get("PR_NUMBER", 0))
         self.pr = self.repo.get_pull(self.pr_number)
-
-        logger.info(
-            "GitHubClient initialised | repo=%s | PR=#%d",
-            repo_name,
-            self.pr_number,
-        )
+        logger.info("GitHubClient initialised | repo=%s | PR=#%d", repo_name, self.pr_number)
 
     # ──────────────────────────────────────────────────────────
     # PR METADATA
     # ──────────────────────────────────────────────────────────
 
-    def get_pr_metadata(self) -> dict:
-        """
-        Returns a flat dictionary of PR metadata that the agent
-        uses throughout its pipeline.
-
-        Fields returned:
-          - number        : PR number (int)
-          - title         : PR title string
-          - body          : PR description / body text
-          - author        : GitHub username of the PR author
-          - base_branch   : branch being merged INTO (e.g. main)
-          - head_branch   : branch being merged FROM (feature branch)
-          - head_sha      : latest commit SHA on the PR branch
-          - base_sha      : commit SHA of the base branch tip
-          - additions     : total lines added across all files
-          - deletions     : total lines deleted across all files
-          - changed_files : count of files changed
-        """
+    def get_pr_metadata(self):
         return {
             "number": self.pr.number,
             "title": self.pr.title,
@@ -89,70 +42,25 @@ class GitHubClient:
     # DIFF FETCHING
     # ──────────────────────────────────────────────────────────
 
-    def get_pr_diff(self) -> str:
-        """
-        Fetches the raw unified diff for the entire PR.
-
-        The unified diff format looks like:
-          diff --git a/src/foo.py b/src/foo.py
-          --- a/src/foo.py
-          +++ b/src/foo.py
-          @@ -10,6 +10,8 @@
-          -old line
-          +new line
-
-        This raw string is passed directly into the LLM in Phase 1,
-        and used to identify changed files for vector DB updates in Phase 2.
-
-        Returns:
-          str: full unified diff, or empty string if fetch fails.
-        """
+    def get_pr_diff(self):
         try:
-            # PyGithub exposes the raw diff via the comparison object
-            comparison = self.repo.compare(
-                self.pr.base.sha, self.pr.head.sha
-            )
-
-            # Build the diff manually from file patches
-            # (PyGithub does not expose one raw .diff string directly)
+            comparison = self.repo.compare(self.pr.base.sha, self.pr.head.sha)
             diff_parts = []
             for file in comparison.files:
-                if file.patch:  # binary files have no patch
+                if file.patch:
                     diff_parts.append(
-                        f"diff --git a/{file.filename} b/{file.filename}\n"
-                        f"{file.patch}"
+                        f"diff --git a/{file.filename} b/{file.filename}\n{file.patch}"
                     )
-
             full_diff = "\n".join(diff_parts)
-            logger.info(
-                "Fetched diff | files=%d | characters=%d",
-                len(diff_parts),
-                len(full_diff),
-            )
+            logger.info("Fetched diff | files=%d | characters=%d", len(diff_parts), len(full_diff))
             return full_diff
-
         except GithubException as e:
             logger.error("Failed to fetch PR diff: %s", e)
             return ""
 
-    def get_changed_files(self) -> list[dict]:
-        """
-        Returns structured metadata for every file changed in the PR.
-
-        Each dict contains:
-          - filename    : relative path from repo root
-          - status      : 'added' | 'modified' | 'removed' | 'renamed'
-          - additions   : lines added in this file
-          - deletions   : lines deleted in this file
-          - patch       : the raw unified diff patch for this file only
-
-        Used in Phase 2 to decide which Pinecone vectors to
-        delete and re-index.
-        """
+    def get_changed_files(self):
         try:
-            comparison = self.repo.compare(
-                self.pr.base.sha, self.pr.head.sha
-            )
+            comparison = self.repo.compare(self.pr.base.sha, self.pr.head.sha)
             files = []
             for f in comparison.files:
                 files.append({
@@ -164,83 +72,154 @@ class GitHubClient:
                 })
             logger.info("Changed files count: %d", len(files))
             return files
-
         except GithubException as e:
             logger.error("Failed to fetch changed files: %s", e)
             return []
 
-    def get_file_content(self, filepath: str) -> str:
-        """
-        Fetches the current content of a file from the HEAD commit
-        of the PR branch. Used in Phase 2 to re-index changed files.
-
-        Args:
-          filepath: relative path from repo root (e.g. 'src/utils.py')
-
-        Returns:
-          str: decoded file content, or empty string if not found.
-        """
+    def get_file_content(self, filepath):
         try:
-            content_file = self.repo.get_contents(
-                filepath, ref=self.pr.head.sha
-            )
-            # content_file.decoded_content returns bytes
+            content_file = self.repo.get_contents(filepath, ref=self.pr.head.sha)
             return content_file.decoded_content.decode("utf-8", errors="replace")
-
         except GithubException as e:
             logger.warning("Could not fetch file content for %s: %s", filepath, e)
             return ""
 
     # ──────────────────────────────────────────────────────────
-    # POSTING FEEDBACK
+    # POSTING FEEDBACK — Phase 1 (plain comment)
     # ──────────────────────────────────────────────────────────
 
-    def post_pr_comment(self, body: str) -> None:
-        """
-        Posts a top-level markdown comment to the PR thread.
-        This is the Phase 1 feedback delivery mechanism.
-
-        In Phase 3 this will be supplemented with inline comments
-        posted directly on specific diff lines.
-
-        Args:
-          body: Markdown-formatted string to post as the comment.
-        """
+    def post_pr_comment(self, body):
         try:
             self.pr.create_issue_comment(body)
             logger.info("Posted PR comment successfully (PR #%d)", self.pr_number)
         except GithubException as e:
             logger.error("Failed to post PR comment: %s", e)
 
-    def post_inline_comment(
-        self,
-        commit_sha: str,
-        filepath: str,
-        line: int,
-        body: str,
-    ) -> None:
-        """
-        Posts an inline review comment on a specific line of the diff.
-        Reserved for Phase 3 — stubbed here so imports don't break.
+    # ──────────────────────────────────────────────────────────
+    # POSTING FEEDBACK — Phase 3 (inline review comments)
+    # ──────────────────────────────────────────────────────────
 
-        Args:
-          commit_sha : the HEAD commit SHA of the PR
-          filepath   : relative file path (e.g. 'src/foo.py')
-          line       : line number in the NEW file version
-          body       : markdown comment body
+    def post_review_with_inline_comments(self, review_data, commit_sha=None):
         """
+        Posts a single PR review containing a summary body and
+        inline comments on specific changed lines via GitHub's
+        Review API. Any comment that can't be placed on a valid
+        diff line is appended to the summary body instead.
+        """
+        commit_sha = commit_sha or self.pr.head.sha
+        valid_positions = self._build_valid_comment_positions()
+
+        sev_emoji = {"CRITICAL": "🚨", "SUGGESTION": "💡", "NITPICK": "🔍"}
+        review_comments = []
+        unplaceable = []
+
+        for c in review_data.get("inline_comments", []):
+            filename = c["file"]
+            line = c["line"]
+            severity = c.get("severity", "SUGGESTION")
+            body = f"{sev_emoji.get(severity, '💬')} **{severity}**: {c['comment']}"
+
+            if (filename, line) in valid_positions:
+                review_comments.append({
+                    "path": filename,
+                    "line": line,
+                    "side": "RIGHT",
+                    "body": body,
+                })
+            else:
+                unplaceable.append(f"- `{filename}:{line}` {body}")
+
+        summary_body = self._format_review_summary(review_data, unplaceable)
+
         try:
-            commit = self.repo.get_commit(commit_sha)
-            self.pr.create_review_comment(
-                body=body,
-                commit=commit,
-                path=filepath,
-                line=line,
+            self.pr.create_review(
+                body=summary_body,
+                event="COMMENT",
+                comments=review_comments,
             )
             logger.info(
-                "Posted inline comment | file=%s | line=%d", filepath, line
+                "Posted review | inline=%d | unplaceable=%d | verdict=%s",
+                len(review_comments), len(unplaceable),
+                review_data.get("verdict"),
             )
         except GithubException as e:
-            logger.error(
-                "Failed to post inline comment on %s:%d — %s", filepath, line, e
-            )
+            logger.error("create_review failed: %s — falling back to issue comment", e)
+            fallback = summary_body
+            if review_comments:
+                fallback += "\n\n## Inline Findings\n"
+                for rc in review_comments:
+                    fallback += f"- `{rc['path']}:{rc['line']}` {rc['body']}\n"
+            self.post_pr_comment(fallback)
+
+    def _build_valid_comment_positions(self):
+        """
+        Returns a set of (filename, line_number) that are valid
+        inline comment targets — i.e. lines present in the PR diff.
+        """
+        valid = set()
+        try:
+            files = self.pr.get_files()
+            for f in files:
+                if not f.patch:
+                    continue
+                filename = f.filename
+                new_line = 0
+                for patch_line in f.patch.splitlines():
+                    if patch_line.startswith("@@"):
+                        try:
+                            plus_part = patch_line.split("+")[1].split(" ")[0]
+                            new_line = int(plus_part.split(",")[0]) - 1
+                        except (IndexError, ValueError):
+                            new_line = 0
+                    elif patch_line.startswith("+"):
+                        new_line += 1
+                        valid.add((filename, new_line))
+                    elif patch_line.startswith("-"):
+                        pass
+                    else:
+                        new_line += 1
+                        valid.add((filename, new_line))
+        except Exception as e:
+            logger.warning("Could not build valid comment positions: %s", e)
+        return valid
+
+    def _format_review_summary(self, review_data, unplaceable):
+        """Formats the top-level review summary as markdown."""
+        verdict = review_data.get("verdict", "NEEDS_DISCUSSION")
+        verdict_emoji = {
+            "APPROVE": "✅",
+            "REQUEST_CHANGES": "🔴",
+            "NEEDS_DISCUSSION": "🟡",
+        }.get(verdict, "🟡")
+
+        parts = ["## 🤖 Automated PR Review\n"]
+
+        parts.append("### 📋 Summary")
+        parts.append(review_data.get("summary", "_No summary._") + "\n")
+
+        positives = review_data.get("positives", [])
+        if positives:
+            parts.append("### ✅ What's Good")
+            for p in positives:
+                parts.append(f"- {p}")
+            parts.append("")
+
+        general = review_data.get("general_comments", [])
+        if general:
+            parts.append("### 💬 General Comments")
+            for g in general:
+                parts.append(f"- {g}")
+            parts.append("")
+
+        if unplaceable:
+            parts.append("### 📌 Additional Findings")
+            parts.append("_These relate to code outside the changed lines:_")
+            parts.extend(unplaceable)
+            parts.append("")
+
+        parts.append("### 📊 Overall Verdict")
+        parts.append(f"{verdict_emoji} **{verdict.replace('_', ' ')}**\n")
+        parts.append("---")
+        parts.append("*Automated review — use human judgment before merging.*")
+
+        return "\n".join(parts)
