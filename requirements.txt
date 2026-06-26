@@ -43,3 +43,4 @@ tiktoken>=0.7.0         # Token counting for LLM context safety
 tqdm>=4.66.0            # Progress bars for indexing script
 pathspec>=0.12.0        # .gitignore pattern matching
 chardet>=5.2.0          # File encoding detection
+einops>=0.7.0
