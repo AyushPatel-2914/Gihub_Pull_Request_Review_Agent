@@ -1,0 +1,77 @@
+name: Automated PR Review Agent
+
+# ─────────────────────────────────────────────────────────────
+# TRIGGER: Fire on pull_request events — when a PR is opened
+# or new commits are pushed to an existing PR (synchronize).
+# ─────────────────────────────────────────────────────────────
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  pr-review:
+    name: Run PR Review Agent
+    runs-on: ubuntu-latest
+
+    # ── Permissions ──────────────────────────────────────────
+    # pull-requests: write  → allows posting comments to the PR
+    # contents: read        → allows reading repo files & diff
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      # ── Step 1: Check out the full repo ───────────────────
+      # fetch-depth: 0 ensures we get the complete git history
+      # so we can compute the full diff against the base branch.
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Step 2: Set up Python runtime ─────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Step 3: Cache pip dependencies ────────────────────
+      # Caches the pip download cache between runs so
+      # dependency installation is fast on subsequent PRs.
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ── Step 4: Install all Python dependencies ───────────
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      # ── Step 5: Run the PR Review Agent ───────────────────
+      # All secrets are passed as environment variables.
+      # The agent reads these via os.environ — no keys in code.
+      - name: Run PR Review Agent
+        env:
+          # GitHub token: auto-provided by Actions, no setup needed
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # Groq API key: add this in repo Settings → Secrets
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
+          # Pinecone API key: add this in repo Settings → Secrets
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+
+          # PR metadata: auto-injected by GitHub Actions context
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          REPO_FULL_NAME: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+
+        run: python src/agent.py
