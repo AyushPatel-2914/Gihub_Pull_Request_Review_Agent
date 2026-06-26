@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Local module imports ───────────────────────────────────────
-from github.gh_client import GitHubClient
+from gh.gh_client import GitHubClient
 from analysis.static_analyzer import analyze_changed_files
 from llm.groq_client import GroqLLMClient
 
