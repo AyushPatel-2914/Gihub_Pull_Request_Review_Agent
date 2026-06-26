@@ -1,223 +1,122 @@
-"""
-src/agent.py
-─────────────────────────────────────────────────────────────
-PR Review Agent — Main Orchestrator
-This is the entry point called by GitHub Actions: `python src/agent.py`
-
-Phase 1 execution flow:
-  1. Load environment variables
-  2. Initialize GitHub client → fetch PR metadata, diff, changed files
-  3. Fetch file contents for each changed file
-  4. Run static analysis across all changed files
-  5. Send diff + static findings to Llama 3 via Groq
-  6. Post the markdown review back to the GitHub PR thread
-
-Each phase will extend this file by adding steps between
-the existing ones — the flow grows downward naturally.
-─────────────────────────────────────────────────────────────
-"""
-
-import os
-import sys
-import logging
-
-# Load .env for local development — no-op in GitHub Actions
-# (environment variables are already set by the workflow)
+import os, sys, logging
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Local module imports ───────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from gh.gh_client import GitHubClient
 from analysis.static_analyzer import analyze_changed_files
 from llm.groq_client import GroqLLMClient
+from ingestion.file_parser import parse_file
+from ingestion.embedder import Embedder
+from retrieval.pinecone_client import PineconeClient
+from rag.retriever import SelfHealingRetriever
 
-
-# ──────────────────────────────────────────────────────────────
-# LOGGING SETUP
-# ──────────────────────────────────────────────────────────────
-# Format shows timestamp, level, module name, and message.
-# In GitHub Actions, this output appears in the workflow run logs.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("agent")
 
-
-# ──────────────────────────────────────────────────────────────
-# HELPER: VALIDATE REQUIRED ENVIRONMENT VARIABLES
-# ──────────────────────────────────────────────────────────────
-
-def validate_environment() -> None:
-    """
-    Checks that all required environment variables are present
-    before the agent does any work.
-
-    Raises:
-      SystemExit: if any required variable is missing,
-                  with a clear message about which one is absent
-                  and how to fix it.
-    """
-    required = {
-        "GITHUB_TOKEN": "Auto-injected by GitHub Actions. For local dev, add to .env",
-        "GROQ_API_KEY": "Get a free key at https://console.groq.com — add to GitHub Secrets",
-        "PINECONE_API_KEY": "Get a free key at https://app.pinecone.io — add to GitHub Secrets",
-        "PR_NUMBER": "Auto-injected by GitHub Actions workflow",
-        "REPO_FULL_NAME": "Auto-injected by GitHub Actions workflow",
-    }
-
-    missing = []
-    for var, hint in required.items():
-        if not os.environ.get(var):
-            missing.append(f"  ✗ {var}: {hint}")
-
+def validate_environment():
+    required = {"GITHUB_TOKEN": "Auto-injected by GitHub Actions", "GROQ_API_KEY": "Get free key at https://console.groq.com", "PINECONE_API_KEY": "Get free key at https://app.pinecone.io", "PR_NUMBER": "Auto-injected by GitHub Actions", "REPO_FULL_NAME": "Auto-injected by GitHub Actions"}
+    missing = [f"  x {var}: {hint}" for var, hint in required.items() if not os.environ.get(var)]
     if missing:
-        logger.error(
-            "Missing required environment variables:\n%s", "\n".join(missing)
-        )
+        logger.error("Missing environment variables:\n%s", "\n".join(missing))
         sys.exit(1)
+    logger.info("Environment validation passed")
 
-    logger.info("Environment validation passed ✓")
-
-
-# ──────────────────────────────────────────────────────────────
-# PHASE 1: MAIN PIPELINE
-# ──────────────────────────────────────────────────────────────
-
-def run_phase1() -> None:
-    """
-    Executes the complete Phase 1 review pipeline:
-      Step 1 → Validate environment
-      Step 2 → Fetch PR data from GitHub
-      Step 3 → Fetch content of changed files
-      Step 4 → Run static analysis
-      Step 5 → Generate LLM review via Groq
-      Step 6 → Post review comment to GitHub PR
-    """
-
-    # ── Step 1: Environment Check ──────────────────────────────
+def run_agent():
     logger.info("=" * 60)
-    logger.info("PR Review Agent — Phase 1 Starting")
+    logger.info("PR Review Agent - Phase 1 + 2 Starting")
     logger.info("=" * 60)
     validate_environment()
 
-    # ── Step 2: Fetch PR Data ──────────────────────────────────
-    logger.info("Step 2: Initialising GitHub client...")
+    logger.info("Step 2: Fetching PR data from GitHub...")
     gh = GitHubClient()
-
     pr_metadata = gh.get_pr_metadata()
-    logger.info(
-        "PR metadata fetched | PR=#%d | title='%s' | author=%s | files=%d",
-        pr_metadata["number"],
-        pr_metadata["title"],
-        pr_metadata["author"],
-        pr_metadata["changed_files"],
-    )
-
     diff = gh.get_pr_diff()
-    if not diff:
-        logger.warning("Empty diff received — PR may have no text changes.")
-
     changed_files = gh.get_changed_files()
-    logger.info("Changed files retrieved: %d file(s)", len(changed_files))
+    logger.info("PR #%d | author=%s | files=%d | +%d/-%d", pr_metadata["number"], pr_metadata["author"], pr_metadata["changed_files"], pr_metadata["additions"], pr_metadata["deletions"])
 
-    # ── Step 3: Fetch File Contents ────────────────────────────
-    # We need the actual file content (not just the diff patch)
-    # for static analysis tools like flake8 and yamllint.
-    # Deleted files are skipped — they have no content to fetch.
-    logger.info("Step 3: Fetching file contents for static analysis...")
-
+    logger.info("Step 3: Fetching file contents...")
     for file_info in changed_files:
         if file_info["status"] == "removed":
             file_info["content"] = ""
-            logger.debug("Skipping content fetch for removed file: %s", file_info["filename"])
             continue
+        file_info["content"] = gh.get_file_content(file_info["filename"])
 
-        content = gh.get_file_content(file_info["filename"])
-        file_info["content"] = content
-        logger.debug(
-            "Fetched content | file=%s | chars=%d",
-            file_info["filename"],
-            len(content),
-        )
-
-    # ── Step 4: Static Analysis ────────────────────────────────
     logger.info("Step 4: Running static analysis...")
     static_report = analyze_changed_files(changed_files)
+    logger.info("Static analysis: %s", "issues found" if static_report else "clean")
 
-    if static_report:
-        logger.info("Static analysis found issues — injecting into LLM context")
-    else:
-        logger.info("Static analysis: no issues found across changed files")
+    rag_context = ""
+    try:
+        logger.info("Step 4b: Updating Pinecone index for changed files...")
+        pinecone_client = PineconeClient()
+        for file_info in changed_files:
+            if file_info["status"] in ("modified", "removed", "renamed"):
+                logger.info("Deleting old vectors for: %s", file_info["filename"])
+                pinecone_client.delete_by_filepath(file_info["filename"])
 
-    # ── Step 5: LLM Review Generation ─────────────────────────
+        embedder = Embedder()
+        namespace = pinecone_client.namespace
+        files_to_index = [f for f in changed_files if f["status"] != "removed" and f.get("content", "").strip()]
+
+        if files_to_index:
+            logger.info("Step 4c: Re-indexing %d changed file(s)...", len(files_to_index))
+            all_new_chunks = []
+            for file_info in files_to_index:
+                chunks = parse_file(filepath=file_info["filename"], content=file_info["content"], namespace=namespace)
+                all_new_chunks.extend(chunks)
+            if all_new_chunks:
+                from ingestion.embedder import SEARCH_DOCUMENT_PREFIX
+                texts = [SEARCH_DOCUMENT_PREFIX + c.content for c in all_new_chunks]
+                vectors_raw = embedder.model.encode(texts, batch_size=8, show_progress_bar=False, normalize_embeddings=True, convert_to_numpy=True)
+                pinecone_vectors = [(c.chunk_id, v.tolist(), c.to_pinecone_metadata()) for c, v in zip(all_new_chunks, vectors_raw)]
+                pinecone_client.upsert_vectors(pinecone_vectors, namespace=namespace)
+                logger.info("Re-indexed %d chunks", len(all_new_chunks))
+
+        logger.info("Step 4d: Running Self-Healing RAG retrieval...")
+        retriever = SelfHealingRetriever(embedder=embedder, pinecone_client=pinecone_client)
+        rag_result = retriever.retrieve(diff=diff, pr_metadata=pr_metadata)
+        logger.info("RAG complete | chunks=%d | healing_rounds=%d | was_healed=%s", len(rag_result.chunks), rag_result.healing_rounds, rag_result.was_healed)
+        rag_context = rag_result.context_string
+        if rag_result.was_healed:
+            static_report += f"\n\n> Self-Healing RAG ran {rag_result.healing_rounds} healing round(s)."
+
+    except Exception as e:
+        logger.error("Phase 2 RAG pipeline failed: %s - falling back to Phase 1", e)
+        rag_context = ""
+
     logger.info("Step 5: Generating AI review via Groq (Llama 3)...")
     llm = GroqLLMClient()
+    combined_context = ""
+    if static_report:
+        combined_context += static_report + "\n\n"
+    if rag_context:
+        combined_context += rag_context
+    review_markdown = llm.generate_review(pr_metadata=pr_metadata, diff=diff, static_analysis_report=combined_context)
+    logger.info("Review generated | chars=%d", len(review_markdown))
 
-    review_markdown = llm.generate_review(
-        pr_metadata=pr_metadata,
-        diff=diff,
-        static_analysis_report=static_report,
-    )
-    logger.info("LLM review generated | chars=%d", len(review_markdown))
-
-    # ── Step 6: Post to GitHub ─────────────────────────────────
-    logger.info("Step 6: Posting review comment to GitHub PR #%d...", pr_metadata["number"])
-
-    # Prepend a metadata header to the GitHub comment
-    # This helps engineering managers immediately see key stats
-    header = _build_comment_header(pr_metadata)
-    full_comment = header + "\n\n" + review_markdown
-
-    gh.post_pr_comment(full_comment)
-
-    logger.info("=" * 60)
-    logger.info("Phase 1 Complete — Review posted to PR #%d", pr_metadata["number"])
-    logger.info("=" * 60)
-
-
-# ──────────────────────────────────────────────────────────────
-# HELPER: COMMENT HEADER
-# ──────────────────────────────────────────────────────────────
-
-def _build_comment_header(pr_metadata: dict) -> str:
-    """
-    Builds a compact metadata table that sits at the top of
-    every GitHub comment posted by the agent.
-
-    This gives engineering managers an instant snapshot of
-    PR scope before reading the detailed review.
-    """
-    return (
+    logger.info("Step 6: Posting review to PR #%d...", pr_metadata["number"])
+    rag_status = "Active" if rag_context else "Skipped (run index_repo.py first)"
+    header = (
         f"<!-- pr-review-agent -->\n"
         f"| Metric | Value |\n"
         f"|--------|-------|\n"
         f"| **PR** | #{pr_metadata['number']}: {pr_metadata['title']} |\n"
         f"| **Author** | `{pr_metadata['author']}` |\n"
-        f"| **Branch** | `{pr_metadata['head_branch']}` → `{pr_metadata['base_branch']}` |\n"
-        f"| **Scope** | "
-        f"+{pr_metadata['additions']} / -{pr_metadata['deletions']} lines, "
-        f"{pr_metadata['changed_files']} file(s) |\n"
+        f"| **Branch** | `{pr_metadata['head_branch']}` to `{pr_metadata['base_branch']}` |\n"
+        f"| **Scope** | +{pr_metadata['additions']} / -{pr_metadata['deletions']} lines, {pr_metadata['changed_files']} file(s) |\n"
         f"| **Review Engine** | Llama 3.3 70B via Groq |\n"
+        f"| **RAG Context** | {rag_status} |\n"
     )
-
-
-# ──────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ──────────────────────────────────────────────────────────────
+    gh.post_pr_comment(header + "\n\n" + review_markdown)
+    logger.info("=" * 60)
+    logger.info("Agent complete | PR #%d reviewed successfully", pr_metadata["number"])
+    logger.info("=" * 60)
 
 if __name__ == "__main__":
-    """
-    Called directly by GitHub Actions:
-      run: python src/agent.py
-
-    As phases are added, this block will route to the correct
-    phase runner. For now, Phase 1 is always executed.
-    """
     try:
-        run_phase1()
+        run_agent()
     except Exception as e:
-        logger.exception("Unhandled exception in agent: %s", e)
+        logger.exception("Unhandled exception: %s", e)
         sys.exit(1)
