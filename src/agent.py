@@ -13,6 +13,8 @@ from retrieval.pinecone_client import PineconeClient
 from rag.retriever import SelfHealingRetriever
 from ml.intent_router import classify_intent
 from ml.reranker import CrossEncoderReranker
+from ml.risk_scorer import score_pr_risk, format_risk_section
+from ml.token_optimizer import TokenOptimizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,7 +42,7 @@ def validate_environment():
 
 def run_agent():
     logger.info("=" * 60)
-    logger.info("PR Review Agent - Phase 1 + 2 + 3 Starting")
+    logger.info("PR Review Agent - Phase 1-5A Starting")
     logger.info("=" * 60)
     validate_environment()
 
@@ -68,15 +70,17 @@ def run_agent():
     static_report = analyze_changed_files(changed_files)
     logger.info("Static analysis: %s", "issues found" if static_report else "clean")
 
+    # ── Step 4-risk: Predictive Risk Scoring (Phase 5A) ───────
+    logger.info("Step 4-risk: Computing PR risk score...")
+    risk_result = score_pr_risk(pr_metadata, changed_files, diff)
+    logger.info("Risk: %d%% (%s)", risk_result.score, risk_result.level)
+
     # ── Step 4a: Intent classification (Phase 3) ──────────────
     logger.info("Step 4a: Classifying PR intent...")
     intent_result = classify_intent(pr_metadata, diff, changed_files)
-    logger.info("Intent: %s (confidence=%.2f) — %s",
-                intent_result.intent.value,
-                intent_result.confidence,
-                intent_result.reasoning)
+    logger.info("Intent: %s (%.0f%%)", intent_result.intent.value, intent_result.confidence * 100)
 
-    # ── Step 4b-4d: Pinecone update + Self-Healing RAG ────────
+    # ── Step 4b-4e: RAG + re-ranking ──────────────────────────
     rag_context = ""
     rag_chunks = []
     try:
@@ -120,11 +124,9 @@ def run_agent():
         logger.info("RAG complete | chunks=%d | healing_rounds=%d",
                     len(rag_chunks), rag_result.healing_rounds)
 
-        # ── Step 4e: Cross-encoder re-ranking (Phase 3) ───────
         if rag_chunks:
-            logger.info("Step 4e: Re-ranking %d chunks with cross-encoder...", len(rag_chunks))
+            logger.info("Step 4e: Re-ranking %d chunks...", len(rag_chunks))
             reranker = CrossEncoderReranker()
-            # Use the PR title + added diff lines as the rerank query
             rerank_query = pr_metadata["title"] + "\n" + "\n".join(
                 l[1:] for l in diff.splitlines()
                 if l.startswith("+") and not l.startswith("+++")
@@ -132,17 +134,30 @@ def run_agent():
             rag_chunks = reranker.rerank(rerank_query, rag_chunks)
             logger.info("After re-ranking: %d chunks kept", len(rag_chunks))
 
-        # Rebuild context string from re-ranked chunks
-        rag_context = _format_rag_context(rag_chunks)
-
     except Exception as e:
         logger.error("Phase 2/3 RAG pipeline failed: %s — continuing without RAG", e)
-        rag_context = ""
+        rag_chunks = []
 
-    # ── Step 5: Structured review with intent focus (Phase 3) ─
+    # ── Step 4-token: Token optimization (Phase 5A) ───────────
+    logger.info("Step 4-token: Optimizing token budget...")
+    optimizer = TokenOptimizer()
+    optimized = optimizer.optimize(
+        diff=diff,
+        rag_chunks=rag_chunks,
+        static_report=static_report or "",
+    )
+    diff = optimized["diff"]
+    rag_chunks = optimized["rag_chunks"]
+    static_report = optimized["static_report"]
+    if optimized["was_trimmed"]:
+        logger.info("Content was trimmed to fit token budget")
+
+    # Rebuild RAG context string from (possibly trimmed) chunks
+    rag_context = _format_rag_context(rag_chunks)
+
+    # ── Step 5: Structured review (Phase 3) ───────────────────
     logger.info("Step 5: Generating structured AI review via Groq...")
     llm = GroqLLMClient()
-
     combined_context = ""
     if static_report:
         combined_context += static_report + "\n\n"
@@ -159,23 +174,29 @@ def run_agent():
                 len(review_data.get("inline_comments", [])),
                 review_data.get("verdict"))
 
-    # ── Step 6: Post review with inline comments (Phase 3) ────
+    # ── Step 6: Post review with risk + inline comments ───────
     logger.info("Step 6: Posting review to PR #%d...", pr_metadata["number"])
 
-    # Prepend the metadata header to the summary
-    review_data["summary"] = _build_header(pr_metadata, intent_result,
-                                            rag_context, len(rag_chunks)) + \
-                             "\n\n" + review_data.get("summary", "")
+    # Build the header with risk score + intent + RAG status
+    header = _build_header(pr_metadata, intent_result, risk_result,
+                           rag_context, len(rag_chunks),
+                           optimized["was_trimmed"])
+
+    # Inject risk section + header into the summary
+    risk_section = format_risk_section(risk_result)
+    review_data["summary"] = (
+        header + "\n\n" + risk_section + "\n\n" + review_data.get("summary", "")
+    )
 
     gh.post_review_with_inline_comments(review_data, commit_sha=pr_metadata["head_sha"])
 
     logger.info("=" * 60)
-    logger.info("Agent complete | PR #%d reviewed successfully", pr_metadata["number"])
+    logger.info("Agent complete | PR #%d | risk=%d%% | reviewed successfully",
+                pr_metadata["number"], risk_result.score)
     logger.info("=" * 60)
 
 
 def _format_rag_context(chunks):
-    """Formats re-ranked chunks into the LLM context string."""
     if not chunks:
         return ""
     parts = ["## Relevant Codebase Context (RAG + Re-ranked)\n"]
@@ -194,20 +215,22 @@ def _format_rag_context(chunks):
     return "\n".join(parts)
 
 
-def _build_header(pr_metadata, intent_result, rag_context, chunk_count):
-    """Builds the metadata table shown at the top of the review."""
+def _build_header(pr_metadata, intent_result, risk_result, rag_context,
+                  chunk_count, was_trimmed):
     rag_status = f"✅ {chunk_count} chunks" if rag_context else "⚠️ Skipped"
+    trim_note = " (trimmed)" if was_trimmed else ""
     return (
         f"<!-- pr-review-agent -->\n"
         f"| Metric | Value |\n"
         f"|--------|-------|\n"
         f"| **PR** | #{pr_metadata['number']}: {pr_metadata['title']} |\n"
         f"| **Author** | `{pr_metadata['author']}` |\n"
+        f"| **Risk Score** | {risk_result.emoji} **{risk_result.score}% {risk_result.level}** |\n"
         f"| **Intent** | {intent_result.intent.value} ({intent_result.confidence:.0%}) |\n"
         f"| **Scope** | +{pr_metadata['additions']} / -{pr_metadata['deletions']} lines, "
         f"{pr_metadata['changed_files']} file(s) |\n"
         f"| **Review Engine** | Llama 3.3 70B via Groq |\n"
-        f"| **RAG Context** | {rag_status} (re-ranked) |\n"
+        f"| **RAG Context** | {rag_status} (re-ranked){trim_note} |\n"
     )
 
 
