@@ -386,3 +386,7 @@ def format_risk_section(result: RiskResult) -> str:
     for factor in result.factors:
         parts.append(f"- {factor}")
     return "\n".join(parts)
+
+# testing RAG retrieval
+
+# rag final test
