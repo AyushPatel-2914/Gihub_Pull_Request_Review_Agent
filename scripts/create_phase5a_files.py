@@ -1,19 +1,21 @@
 import os
-src = r'C:\Users\ASUS\Downloads'  # adjust if files are elsewhere
+src = r'C:\Users\ASUS\Downloads'
 
 mapping = {
-    'risk_scorer.py': 'src/ml/risk_scorer.py',
-    'token_optimizer.py': 'src/ml/token_optimizer.py',
+    'agent_core.py': 'src/agent_core.py',
     'agent.py': 'src/agent.py',
-    'train_risk_model.py': 'scripts/train_risk_model.py',
+    'webhook_server.py': 'src/server/webhook_server.py',
+    'Dockerfile': 'Dockerfile',
 }
 
 for fname, dest in mapping.items():
     with open(os.path.join(src, fname), encoding='utf-8') as f:
         content = f.read()
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.makedirs(os.path.dirname(dest) or '.', exist_ok=True)
     with open(dest, 'w', encoding='utf-8') as f:
         f.write(content)
-    print(f"Written: {dest} ({len(content)} chars)")
+    print(f"Written: {dest}")
 
+# server needs an __init__.py
+open('src/server/__init__.py', 'w').close()
 print("Done!")
