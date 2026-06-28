@@ -333,3 +333,4 @@ def analyze_changed_files(changed_files: list[dict]) -> str:
     header = "## Static Analysis Pre-Check\n"
     header += "The following objective issues were detected BEFORE LLM review:\n"
     return header + "\n".join(all_findings)
+# Phase 5A risk test
