@@ -279,3 +279,5 @@ def classify_intent(pr_metadata: dict, diff: str, changed_files: list) -> Intent
         return _classify_with_llm(pr_metadata, diff, changed_files)
 
     return _classify_with_llm(pr_metadata, diff, changed_files)
+
+# testing RAG retrieval
