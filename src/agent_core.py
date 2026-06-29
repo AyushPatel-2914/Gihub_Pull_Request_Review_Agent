@@ -32,6 +32,7 @@ from ingestion.file_parser import parse_file
 from ingestion.embedder import Embedder, SEARCH_DOCUMENT_PREFIX
 from retrieval.pinecone_client import PineconeClient
 from rag.retriever import SelfHealingRetriever
+from rag.completeness_critic import CompletenessCritic
 from ml.intent_router import classify_intent
 from ml.reranker import CrossEncoderReranker
 from ml.risk_scorer import score_pr_risk, format_risk_section
@@ -115,6 +116,8 @@ def run_review(repo_full_name: str, pr_number: int) -> dict:
 
     # ── RAG + re-ranking (Phase 2 + 3) ────────────────────────
     rag_chunks = []
+    critique_ran = False
+    critique_sufficient = True
     try:
         pinecone_client = PineconeClient()
         for file_info in changed_files:
@@ -146,9 +149,20 @@ def run_review(repo_full_name: str, pr_number: int) -> dict:
                 ]
                 pinecone_client.upsert_vectors(pinecone_vectors, namespace=namespace)
 
-        retriever = SelfHealingRetriever(embedder=embedder, pinecone_client=pinecone_client)
+        # Phase 4: build the LLM completeness critic and pass it
+        # to the retriever so it runs a semantic sufficiency check
+        # after string-based healing.
+        critic = CompletenessCritic(GroqLLMClient())
+        retriever = SelfHealingRetriever(
+            embedder=embedder,
+            pinecone_client=pinecone_client,
+            critic=critic,
+        )
         rag_result = retriever.retrieve(diff=diff, pr_metadata=pr_metadata)
         rag_chunks = rag_result.chunks
+        # Phase 4: capture critique diagnostics for the PR comment
+        critique_ran = rag_result.critique_ran
+        critique_sufficient = rag_result.critique_sufficient
 
         if rag_chunks:
             reranker = _get_reranker()
@@ -189,7 +203,8 @@ def run_review(repo_full_name: str, pr_number: int) -> dict:
 
     # ── Post review ───────────────────────────────────────────
     header = _build_header(pr_metadata, intent_result, risk_result,
-                           rag_context, len(rag_chunks), optimized["was_trimmed"])
+                           rag_context, len(rag_chunks), optimized["was_trimmed"],
+                           critique_ran, critique_sufficient)
     risk_section = format_risk_section(risk_result)
     review_data["summary"] = (
         header + "\n\n" + risk_section + "\n\n" + review_data.get("summary", "")
@@ -230,9 +245,16 @@ def _format_rag_context(chunks):
 
 
 def _build_header(pr_metadata, intent_result, risk_result, rag_context,
-                  chunk_count, was_trimmed):
+                  chunk_count, was_trimmed, critique_ran=False, critique_sufficient=True):
     rag_status = f"✅ {chunk_count} chunks" if rag_context else "⚠️ Skipped"
     trim_note = " (trimmed)" if was_trimmed else ""
+
+    # Phase 4: completeness critique status row
+    if critique_ran:
+        critique_status = "✅ Sufficient" if critique_sufficient else "🔄 Healed (was insufficient)"
+    else:
+        critique_status = "— Not run"
+
     return (
         f"<!-- pr-review-agent -->\n"
         f"| Metric | Value |\n"
@@ -245,4 +267,5 @@ def _build_header(pr_metadata, intent_result, risk_result, rag_context,
         f"{pr_metadata['changed_files']} file(s) |\n"
         f"| **Review Engine** | Llama 3.3 70B via Groq |\n"
         f"| **RAG Context** | {rag_status} (re-ranked){trim_note} |\n"
+        f"| **Completeness Critique** | {critique_status} |\n"
     )
