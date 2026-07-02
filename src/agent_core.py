@@ -214,6 +214,23 @@ def run_review(repo_full_name: str, pr_number: int) -> dict:
 
     logger.info("Review posted | PR #%d | risk=%d%%", pr_number, risk_result.score)
 
+
+    # Save to dashboard DB
+    try:
+        from db.supabase_writer import save_review as save_to_db
+        save_to_db(
+            pr_metadata={**pr_metadata, 'repo_full_name': repo_full_name},
+            review_data=review_data,
+            risk_result=risk_result,
+            intent_result=intent_result,
+            rag_result_chunks=rag_chunks,
+            critique_ran=critique_ran,
+            critique_sufficient=critique_sufficient,
+            was_healed=False,
+        )
+    except Exception as e:
+        logger.error('Dashboard save failed: %s', e)
+
     return {
         "pr_number": pr_number,
         "repo": repo_full_name,
