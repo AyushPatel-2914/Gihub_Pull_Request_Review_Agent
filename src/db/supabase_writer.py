@@ -1,62 +1,27 @@
-"""
-src/db/supabase_writer.py
-─────────────────────────────────────────────────────────────
-Supabase Writer — Persists Every Review to the Dashboard DB
-
-After the agent generates a review, this module saves it to
-Supabase so the dashboard can display it.
-
-Called at the end of agent_core.run_review() with the full
-review data — review_data, risk_result, intent_result, etc.
-
-Required env var: SUPABASE_URL and SUPABASE_SERVICE_KEY
-These are added as GitHub Actions secrets.
-
-If Supabase is not configured, this module logs a warning
-and returns silently — the review is still posted to GitHub,
-the dashboard just won't have a record of it.
-─────────────────────────────────────────────────────────────
-"""
-
 import logging
 import os
 
 logger = logging.getLogger(__name__)
 
 
-def save_review(
-    pr_metadata: dict,
-    review_data: dict,
-    risk_result,
-    intent_result,
-    rag_result_chunks: list,
-    critique_ran: bool,
-    critique_sufficient: bool,
-    was_healed: bool,
-) -> str | None:
-    """
-    Saves a completed review to Supabase.
-
-    Returns the UUID of the created review row, or None on failure.
-    """
+def save_review(pr_metadata, review_data, risk_result, intent_result,
+                rag_result_chunks, critique_ran, critique_sufficient, was_healed):
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
 
     if not supabase_url or not supabase_key:
-        logger.info(
-            "SUPABASE_URL or SUPABASE_SERVICE_KEY not set — "
-            "skipping dashboard persistence. Review posted to GitHub only."
-        )
+        logger.info("Supabase not configured - skipping dashboard save")
         return None
 
     try:
         from supabase import create_client
         db = create_client(supabase_url, supabase_key)
 
-        # ── Insert PR review ──────────────────────────────────
+        repo_full_name = pr_metadata.get("repo_full_name",
+                         os.environ.get("REPO_FULL_NAME", ""))
+
         review_row = {
-            "repo_full_name": pr_metadata.get("repo_full_name",
-                             os.environ.get("REPO_FULL_NAME", "")),
+            "repo_full_name": repo_full_name,
             "pr_number": pr_metadata["number"],
             "pr_title": pr_metadata["title"],
             "pr_author": pr_metadata["author"],
@@ -90,7 +55,6 @@ def save_review(
         review_id = result.data[0]["id"]
         logger.info("Review saved to Supabase | id=%s", review_id)
 
-        # ── Insert inline comments ────────────────────────────
         inline_rows = [
             {
                 "review_id": review_id,
@@ -103,9 +67,7 @@ def save_review(
         ]
         if inline_rows:
             db.table("inline_comments").insert(inline_rows).execute()
-            logger.info("Saved %d inline comments", len(inline_rows))
 
-        # ── Insert general comments ───────────────────────────
         general_rows = [
             {"review_id": review_id, "comment": c}
             for c in review_data.get("general_comments", [])
@@ -113,11 +75,10 @@ def save_review(
         if general_rows:
             db.table("general_comments").insert(general_rows).execute()
 
-        # ── Insert risk factors ───────────────────────────────
         factor_rows = [
             {"review_id": review_id, "factor": f}
             for f in risk_result.factors
-            if not f.startswith("✓")  # exclude "tests reduce risk" positive
+            if not f.startswith("\u2713")
         ]
         if factor_rows:
             db.table("risk_factors").insert(factor_rows).execute()
