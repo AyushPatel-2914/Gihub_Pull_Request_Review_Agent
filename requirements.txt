@@ -48,3 +48,7 @@ einops>=0.7.0
 einops>=0.7.0
 
 einops>=0.7.0
+
+supabase>=2.3.0
+
+supabase>=2.3.0
